@@ -13,6 +13,8 @@ use tantivy_fst::automaton::{AlwaysMatch, Automaton};
 
 use crate::directory::FileSlice;
 use crate::positions::PositionReader;
+#[cfg(feature = "quickwit")]
+use crate::postings::CandidatePostingsReader;
 use crate::postings::{BlockSegmentPostings, SegmentPostings, TermInfo};
 use crate::schema::{IndexRecordOption, Term, Type};
 use crate::termdict::TermDictionary;
@@ -311,6 +313,47 @@ impl InvertedIndexReader {
 
 #[cfg(feature = "quickwit")]
 impl InvertedIndexReader {
+    /// Prepare a reader for exact candidate-driven access to this term's postings.
+    pub(crate) fn candidate_postings(
+        &self,
+        term_info: &TermInfo,
+        option: IndexRecordOption,
+    ) -> io::Result<CandidatePostingsReader> {
+        use crate::HasLen;
+
+        let postings_range = term_info.postings_range.clone();
+        if postings_range.start > postings_range.end
+            || postings_range.end > self.postings_file_slice.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "term postings range exceeds inverted index",
+            ));
+        }
+        let postings = self.postings_file_slice.slice(postings_range);
+        let positions = if option.downgrade(self.record_option).has_positions() {
+            let positions_range = term_info.positions_range.clone();
+            if positions_range.start > positions_range.end
+                || positions_range.end > self.positions_file_slice.len()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "term positions range exceeds inverted index",
+                ));
+            }
+            Some(self.positions_file_slice.slice(positions_range))
+        } else {
+            None
+        };
+        Ok(CandidatePostingsReader::new(
+            term_info.doc_freq,
+            postings,
+            positions,
+            self.record_option,
+            option,
+        ))
+    }
+
     pub(crate) async fn get_term_info_async(&self, term: &Term) -> io::Result<Option<TermInfo>> {
         self.termdict.get_async(term.serialized_value_bytes()).await
     }

@@ -2,11 +2,11 @@ use std::fmt;
 use std::ops::Bound;
 
 use super::term_weight::TermWeight;
+use crate::Term;
 use crate::query::bm25::Bm25Weight;
 use crate::query::range_query::is_type_valid_for_fastfield_range_query;
 use crate::query::{EnableScoring, Explanation, Query, RangeQuery, Weight};
 use crate::schema::IndexRecordOption;
-use crate::Term;
 
 /// A Term query matches all of the documents
 /// containing a specific term.
@@ -69,6 +69,11 @@ impl fmt::Debug for TermQuery {
 }
 
 impl TermQuery {
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn index_record_option(&self) -> IndexRecordOption {
+        self.index_record_option
+    }
+
     /// Creates a new term query.
     pub fn new(term: Term, segment_postings_options: IndexRecordOption) -> TermQuery {
         TermQuery {
@@ -158,7 +163,7 @@ mod tests {
 
     use crate::collector::{Count, TopDocs};
     use crate::query::{Query, QueryParser, TermQuery};
-    use crate::schema::{IndexRecordOption, IntoIpv6Addr, Schema, INDEXED, STORED};
+    use crate::schema::{INDEXED, IndexRecordOption, IntoIpv6Addr, STORED, Schema};
     use crate::{Index, IndexWriter, Term};
 
     #[test]

@@ -32,6 +32,42 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
             "Async read is not supported.",
         ))
     }
+
+    /// Reads several ranges, preserving their order and exact lengths.
+    ///
+    /// Implementations may coalesce physical reads. The default delegates each
+    /// range to `read_bytes_async`; no synchronous I/O is introduced.
+    async fn read_bytes_batch_async(
+        &self,
+        ranges: Vec<Range<usize>>,
+    ) -> io::Result<Vec<OwnedBytes>> {
+        if ranges
+            .iter()
+            .any(|range| range.start > range.end || range.end > self.len())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid batch range",
+            ));
+        }
+        let mut results = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let expected_len = range.end - range.start;
+            let bytes = if expected_len == 0 {
+                OwnedBytes::empty()
+            } else {
+                self.read_bytes_async(range).await?
+            };
+            if bytes.len() != expected_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Short batch read",
+                ));
+            }
+            results.push(bytes);
+        }
+        Ok(results)
+    }
 }
 
 #[derive(Debug)]
@@ -103,7 +139,8 @@ impl FileHandle for &'static [u8] {
 }
 
 impl<B> From<B> for FileSlice
-where B: StableDeref + Deref<Target = [u8]> + 'static + Send + Sync
+where
+    B: StableDeref + Deref<Target = [u8]> + 'static + Send + Sync,
 {
     fn from(bytes: B) -> FileSlice {
         FileSlice::new(Arc::new(OwnedBytes::new(bytes)))
@@ -235,6 +272,30 @@ impl FileSlice {
         self.data.read_bytes_async(self.range.clone()).await
     }
 
+    /// Reads ranges relative to this slice in one logical batch.
+    ///
+    /// Invalid ranges fail before any I/O. Results have the same order as the
+    /// requests, including duplicate and empty ranges.
+    pub async fn read_bytes_batch_async(
+        &self,
+        ranges: Vec<Range<usize>>,
+    ) -> io::Result<Vec<OwnedBytes>> {
+        if ranges
+            .iter()
+            .any(|range| range.start > range.end || range.end > self.len())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid batch range",
+            ));
+        }
+        let absolute = ranges
+            .into_iter()
+            .map(|range| self.range.start + range.start..self.range.start + range.end)
+            .collect();
+        self.data.read_bytes_batch_async(absolute).await
+    }
+
     /// Reads a specific slice of data.
     ///
     /// This is equivalent to running `file_slice.slice(from, to).read_bytes()`.
@@ -313,6 +374,13 @@ impl FileSlice {
 
 #[async_trait]
 impl FileHandle for FileSlice {
+    async fn read_bytes_batch_async(
+        &self,
+        ranges: Vec<Range<usize>>,
+    ) -> io::Result<Vec<OwnedBytes>> {
+        FileSlice::read_bytes_batch_async(self, ranges).await
+    }
+
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
         self.read_bytes_slice(range)
     }
@@ -348,6 +416,34 @@ mod tests {
     use super::{FileHandle, FileSlice};
     use crate::HasLen;
     use crate::file_slice::combine_ranges;
+
+    #[test]
+    fn test_async_batch_preserves_nested_offsets_and_order() {
+        let slice = FileSlice::new(Arc::new(&b"0123456789abcdef"[..]))
+            .slice(3..14)
+            .slice(2..9);
+        let mut future = std::pin::pin!(slice.read_bytes_batch_async(vec![4..7, 0..2, 1..1, 0..2]));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(result) = future.as_mut().poll(&mut context) else {
+            panic!("in-memory reads must complete immediately");
+        };
+        let bytes = result.unwrap();
+        assert_eq!(
+            bytes.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+            vec![b"9ab".as_slice(), b"56", b"", b"56"]
+        );
+    }
+
+    #[test]
+    fn test_async_batch_rejects_out_of_slice_range() {
+        let slice = FileSlice::new(Arc::new(&b"abcdef"[..])).slice(1..3);
+        let mut future = std::pin::pin!(slice.read_bytes_batch_async(vec![0..3]));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(result) = future.as_mut().poll(&mut context) else {
+            panic!("invalid ranges must fail before reading");
+        };
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn test_file_slice() -> io::Result<()> {

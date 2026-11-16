@@ -124,6 +124,14 @@ impl Default for BlockInfo {
     }
 }
 
+pub(crate) const fn skip_entry_len(record_option: IndexRecordOption) -> usize {
+    match record_option {
+        IndexRecordOption::Basic => 5,
+        IndexRecordOption::WithFreqs => 8,
+        IndexRecordOption::WithFreqsAndPositions => 12,
+    }
+}
+
 impl SkipReader {
     pub fn new(data: OwnedBytes, doc_freq: u32, skip_info: IndexRecordOption) -> SkipReader {
         let mut skip_reader = SkipReader {
@@ -204,12 +212,10 @@ impl SkipReader {
 
     fn read_block_info(&mut self) {
         let bytes = self.owned_read.as_slice();
-        let advance_len: usize;
         self.last_doc_in_block = read_u32(bytes);
         let (doc_num_bits, strict_delta_encoded) = decode_bitwidth(bytes[4]);
         match self.skip_info {
             IndexRecordOption::Basic => {
-                advance_len = 5;
                 self.block_info = BlockInfo::BitPacked {
                     doc_num_bits,
                     strict_delta_encoded,
@@ -223,7 +229,6 @@ impl SkipReader {
                 let tf_num_bits = bytes[5];
                 let block_wand_fieldnorm_id = bytes[6];
                 let block_wand_term_freq = decode_block_wand_max_tf(bytes[7]);
-                advance_len = 8;
                 self.block_info = BlockInfo::BitPacked {
                     doc_num_bits,
                     strict_delta_encoded,
@@ -238,7 +243,6 @@ impl SkipReader {
                 let tf_sum = read_u32(&bytes[6..10]);
                 let block_wand_fieldnorm_id = bytes[10];
                 let block_wand_term_freq = decode_block_wand_max_tf(bytes[11]);
-                advance_len = 12;
                 self.block_info = BlockInfo::BitPacked {
                     doc_num_bits,
                     strict_delta_encoded,
@@ -249,7 +253,7 @@ impl SkipReader {
                 };
             }
         }
-        self.owned_read.advance(advance_len);
+        self.owned_read.advance(skip_entry_len(self.skip_info));
     }
 
     pub fn block_info(&self) -> BlockInfo {

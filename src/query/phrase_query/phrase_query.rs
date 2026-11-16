@@ -27,6 +27,16 @@ pub struct PhraseQuery {
 }
 
 impl PhraseQuery {
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn terms_with_offsets(&self) -> &[(usize, Term)] {
+        &self.phrase_terms
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn slop(&self) -> u32 {
+        self.slop
+    }
+
     /// Creates a new `PhraseQuery` given a list of terms.
     ///
     /// There must be at least two terms, and all terms

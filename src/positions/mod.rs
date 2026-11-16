@@ -28,6 +28,10 @@
 //! * *VIntPosDeltas* := *VIntPosDelta*^(*P* % 128).
 //!
 //! The skip widths encoded separately makes it easy and fast to rapidly skip over n positions.
+#[cfg(feature = "quickwit")]
+mod candidate_reader;
+#[cfg(feature = "quickwit")]
+pub(crate) use candidate_reader::CandidatePositionReader;
 mod reader;
 mod serializer;
 

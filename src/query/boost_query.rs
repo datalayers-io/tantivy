@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
+use crate::docset::{COLLECT_BLOCK_BUFFER_LEN, SeekDangerResult};
 use crate::fastfield::AliveBitSet;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::{DocId, DocSet, Score, SegmentReader, Term};
@@ -16,6 +16,16 @@ pub struct BoostQuery {
 }
 
 impl BoostQuery {
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn query(&self) -> &dyn Query {
+        self.query.as_ref()
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn boost(&self) -> Score {
+        self.boost
+    }
+
     /// Builds a boost query.
     pub fn new(query: Box<dyn Query>, boost: Score) -> BoostQuery {
         BoostQuery { query, boost }

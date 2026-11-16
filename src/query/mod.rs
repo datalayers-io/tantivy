@@ -4,6 +4,8 @@ mod bitset;
 mod bm25;
 mod boolean_query;
 mod boost_query;
+#[cfg(feature = "quickwit")]
+mod candidate_query;
 mod const_score_query;
 mod disjunction;
 mod disjunction_max_query;
@@ -45,6 +47,10 @@ pub use self::bitset::BitSetDocSet;
 pub use self::bm25::{Bm25StatisticsProvider, Bm25Weight};
 pub use self::boolean_query::{BooleanQuery, BooleanWeight};
 pub use self::boost_query::{BoostQuery, BoostWeight};
+#[cfg(feature = "quickwit")]
+pub use self::candidate_query::{
+    prepare_candidate_query, supports_candidate_query, PreparedCandidateQuery,
+};
 pub use self::const_score_query::{ConstScoreQuery, ConstScorer};
 pub use self::disjunction_max_query::DisjunctionMaxQuery;
 pub use self::empty_query::{EmptyQuery, EmptyScorer, EmptyWeight};

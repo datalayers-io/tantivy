@@ -4,7 +4,15 @@ mod block_search;
 
 pub(crate) use self::block_search::search_block;
 
+#[cfg(feature = "quickwit")]
+pub(crate) mod block_read;
 mod block_segment_postings;
+#[cfg(feature = "quickwit")]
+mod candidate_postings;
+#[cfg(feature = "quickwit")]
+pub(crate) use candidate_postings::{CandidatePosting, CandidatePostingsReader};
+#[cfg(all(test, feature = "quickwit"))]
+mod candidate_postings_tests;
 pub(crate) mod compression;
 mod indexing_context;
 mod json_postings_writer;
