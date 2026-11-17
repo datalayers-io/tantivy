@@ -8,6 +8,7 @@ use futures_util::{stream, FutureExt, StreamExt, TryStreamExt};
 use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentId;
 use crate::postings::block_read::yield_once;
+pub use crate::postings::block_read::CandidateReadOptions;
 use crate::postings::{CandidatePosting, Postings};
 use crate::query::phrase_query::PhraseScorer;
 use crate::query::{
@@ -116,14 +117,41 @@ pub async fn prepare_candidate_query(
     searcher: &Searcher,
     query: &dyn Query,
 ) -> crate::Result<Option<PreparedCandidateQuery>> {
-    prepare_with_budget(searcher, query, PREPARATION_BUDGET_BYTES).await
+    prepare_candidate_query_with_options(searcher, query, CandidateReadOptions::default()).await
 }
 
+/// Prepare candidates using the directory's actual batch transport limits.
+///
+/// The options affect only conservative cold-I/O admission. They do not change
+/// matching, scores, or cache correctness. See [`prepare_candidate_query`].
+pub async fn prepare_candidate_query_with_options(
+    searcher: &Searcher,
+    query: &dyn Query,
+    options: CandidateReadOptions,
+) -> crate::Result<Option<PreparedCandidateQuery>> {
+    prepare_with_options_and_budget(searcher, query, options, PREPARATION_BUDGET_BYTES).await
+}
+
+#[cfg(test)]
 async fn prepare_with_budget(
     searcher: &Searcher,
     query: &dyn Query,
     budget: usize,
 ) -> crate::Result<Option<PreparedCandidateQuery>> {
+    prepare_with_options_and_budget(searcher, query, CandidateReadOptions::default(), budget).await
+}
+
+async fn prepare_with_options_and_budget(
+    searcher: &Searcher,
+    query: &dyn Query,
+    options: CandidateReadOptions,
+    budget: usize,
+) -> crate::Result<Option<PreparedCandidateQuery>> {
+    if options.max_read_bytes == 0 {
+        return Err(TantivyError::InvalidArgument(
+            "candidate max_read_bytes must be nonzero".into(),
+        ));
+    }
     let Some((shape, boost)) = shape(query) else {
         return Ok(None);
     };
@@ -182,10 +210,14 @@ async fn prepare_with_budget(
             .saturating_mul(std::mem::size_of::<CandidatePosting>() * 2)
             .saturating_add(std::mem::size_of::<DocId>() * 3)
             .saturating_add(std::mem::size_of::<PreparedRow>() * 4);
-        estimated_bytes = estimated_bytes
-            .saturating_add((leader.doc_freq as usize).saturating_mul(per_doc))
-            .saturating_add(leader.postings_range.len().saturating_mul(2));
+        estimated_bytes =
+            estimated_bytes.saturating_add((leader.doc_freq as usize).saturating_mul(per_doc));
         for info in infos {
+            // Reserve whole postings before fetching any term. A follower may
+            // choose Whole after the leader is decoded; this conservative reserve
+            // prevents a late fallback after reading its metadata or body.
+            estimated_bytes =
+                estimated_bytes.saturating_add(info.postings_range.len().saturating_mul(2));
             // Decoded skip blocks, selected-range bookkeeping and prefix bytes.
             estimated_bytes = estimated_bytes
                 .saturating_add((info.doc_freq as usize / 128 + 1).saturating_mul(256))
@@ -217,6 +249,9 @@ async fn prepare_with_budget(
                         .inverted_index(term.field())?
                         .candidate_postings(info, option)?,
                 );
+            }
+            for cursor in &mut cursors {
+                cursor.set_read_options(options);
             }
             let leader = infos
                 .iter()
@@ -259,9 +294,7 @@ async fn prepare_with_budget(
                     let block_count = hits.iter().fold(0usize, |sum, hit| {
                         sum.saturating_add((hit.term_freq as usize + 254) / 128)
                     });
-                    let raw_bytes = block_count
-                        .saturating_mul(640)
-                        .min(info.positions_range.len());
+                    let raw_bytes = cursor.position_read_bytes(hits)?;
                     let header_bytes = cursor.total_positions().map_or_else(
                         || info.positions_range.len().saturating_mul(9),
                         |total| {
@@ -618,6 +651,7 @@ mod tests {
     struct GuardedDirectory {
         inner: Arc<dyn Directory>,
         forbid_auxiliary_reads: Arc<AtomicBool>,
+        guard_terms: bool,
     }
 
     #[derive(Debug)]
@@ -662,7 +696,12 @@ mod tests {
             if matches!(
                 path.extension().and_then(|ext| ext.to_str()),
                 Some("fieldnorm" | "fast")
-            ) {
+            ) || (self.guard_terms
+                && matches!(
+                    path.extension().and_then(|ext| ext.to_str()),
+                    Some("idx" | "pos")
+                ))
+            {
                 Ok(Arc::new(GuardedHandle {
                     inner,
                     forbid: self.forbid_auxiliary_reads.clone(),
@@ -876,6 +915,7 @@ mod tests {
         let guarded = GuardedDirectory {
             inner: Arc::new(directory),
             forbid_auxiliary_reads: forbid.clone(),
+            guard_terms: false,
         };
         let guarded_index = Index::open(Box::new(guarded) as Box<dyn Directory>)?;
         let searcher = guarded_index.reader()?.searcher();
@@ -956,6 +996,43 @@ mod tests {
         assert!(
             saw_mode_difference,
             "fixture must exercise original mode divergence"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_budget_refuses_before_posting_and_position_reads() -> crate::Result<()> {
+        let mut schema = Schema::builder();
+        let field = schema.add_text_field("text", TEXT);
+        let directory = crate::directory::RamDirectory::create();
+        let index = Index::create(directory.clone(), schema.build(), Default::default())?;
+        let mut writer = index.writer_for_tests::<TantivyDocument>()?;
+        for _ in 0..300 {
+            writer.add_document(doc!(field => "a b a b"))?;
+        }
+        writer.commit()?;
+        let forbid = Arc::new(AtomicBool::new(false));
+        let guarded = GuardedDirectory {
+            inner: Arc::new(directory),
+            forbid_auxiliary_reads: forbid.clone(),
+            guard_terms: true,
+        };
+        let index = Index::open(Box::new(guarded) as Box<dyn Directory>)?;
+        let searcher = index.reader()?.searcher();
+        // Initialize per-field readers before guarding term payloads. Term lookup
+        // itself remains permitted, since its ranges are needed for preflight.
+        for reader in searcher.segment_readers() {
+            reader.inverted_index(field)?;
+        }
+        forbid.store(true, Ordering::SeqCst);
+        let query = PhraseQuery::new(vec![
+            Term::from_field_text(field, "a"),
+            Term::from_field_text(field, "b"),
+        ]);
+        assert!(futures::executor::block_on(prepare_with_budget(&searcher, &query, 1))?.is_none());
+        assert!(
+            futures::executor::block_on(prepare_candidate_query(&searcher, &query)).is_err(),
+            "guard must catch payload reads when the budget admits preparation"
         );
         Ok(())
     }

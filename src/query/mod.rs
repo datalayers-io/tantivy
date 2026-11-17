@@ -49,7 +49,8 @@ pub use self::boolean_query::{BooleanQuery, BooleanWeight};
 pub use self::boost_query::{BoostQuery, BoostWeight};
 #[cfg(feature = "quickwit")]
 pub use self::candidate_query::{
-    prepare_candidate_query, supports_candidate_query, PreparedCandidateQuery,
+    prepare_candidate_query, prepare_candidate_query_with_options, supports_candidate_query,
+    CandidateReadOptions, PreparedCandidateQuery,
 };
 pub use self::const_score_query::{ConstScoreQuery, ConstScorer};
 pub use self::disjunction_max_query::DisjunctionMaxQuery;

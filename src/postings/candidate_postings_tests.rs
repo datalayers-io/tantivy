@@ -123,6 +123,7 @@ struct AsyncFile {
     bytes: OwnedBytes,
     ranges: Mutex<Vec<Range<usize>>>,
     short_read_from: Option<usize>,
+    whole_reads: Mutex<Vec<Range<usize>>>,
 }
 
 impl HasLen for AsyncFile {
@@ -134,6 +135,21 @@ impl HasLen for AsyncFile {
 impl FileHandle for AsyncFile {
     fn read_bytes(&self, _: Range<usize>) -> io::Result<OwnedBytes> {
         panic!("candidate reader issued a synchronous file read");
+    }
+
+    fn read_bytes_async<'a, 'b>(
+        &'a self,
+        range: Range<usize>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<OwnedBytes>> + Send + 'b>>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        Box::pin(async move {
+            self.whole_reads.lock().unwrap().push(range.clone());
+            let mut results = self.read_bytes_batch_async(vec![range]).await?;
+            Ok(results.remove(0))
+        })
     }
 
     fn read_bytes_batch_async<'a, 'b>(
@@ -169,6 +185,7 @@ fn async_file(bytes: Vec<u8>, short_read_from: Option<usize>) -> (Arc<AsyncFile>
         bytes: OwnedBytes::new(bytes),
         ranges: Mutex::default(),
         short_read_from,
+        whole_reads: Mutex::default(),
     });
     (file.clone(), FileSlice::new(file))
 }
@@ -203,7 +220,14 @@ fn sparse_reads_skip_untouched_payloads_and_reuse_metadata() {
         let reads = file.ranges.lock().unwrap();
         assert_eq!(reads.iter().filter(|range| range.start == 0).count(), 1);
         assert!(reads.len() > original_read_count);
-        assert!(reads.iter().map(|range| range.len()).sum::<usize>() < file.len() / 3);
+        let bytes = reads.iter().map(|range| range.len()).sum::<usize>();
+        eprintln!(
+            "Sparse candidate evidence: requests={}, bytes={}, whole_bytes={}",
+            reads.len(),
+            bytes,
+            file.len()
+        );
+        assert!(bytes < file.len() / 3);
     }
 }
 
@@ -385,7 +409,7 @@ fn prefetched_position_blocks_are_reused_across_candidate_batches() {
 }
 
 #[test]
-fn driving_postings_and_positions_use_batch_only_file_handle() {
+fn driving_postings_and_positions_use_whole_async_file_handle() {
     let (postings, positions) = encoded_term(129, WithFreqsAndPositions, true);
     let (postings_file, postings) = async_file(postings, None);
     let (_, positions) = async_file(positions, None);
@@ -443,4 +467,157 @@ fn posting_decoding_yields_with_immediately_ready_batch_io() {
     let selected = poll_across_yield(reader.read_docs(&candidates)).unwrap();
     assert_eq!(selected.len(), 129);
     assert_eq!(selected[128].doc, candidates[128]);
+}
+
+#[test]
+fn dense_candidates_choose_whole_before_metadata_and_reuse_bytes() {
+    let doc_freq = 16_385;
+    let (postings, positions) = encoded_term(doc_freq, WithFreqsAndPositions, true);
+    let (posting_file, postings) = async_file(postings, None);
+    let (position_file, positions) = async_file(positions, None);
+    let mut reader = CandidatePostingsReader::new(
+        doc_freq,
+        postings,
+        Some(positions),
+        WithFreqsAndPositions,
+        WithFreqsAndPositions,
+    );
+    let docs: Vec<_> = (0..doc_freq).map(|doc| doc * 3).collect();
+    let mut hits = block_on(reader.read_docs(&docs)).unwrap();
+    assert_eq!(
+        *posting_file.ranges.lock().unwrap(),
+        vec![0..posting_file.len()]
+    );
+    assert!(reader.total_positions().is_some());
+    block_on(reader.prefetch_positions(&hits)).unwrap();
+    assert_eq!(
+        *position_file.ranges.lock().unwrap(),
+        vec![0..position_file.len()]
+    );
+    block_on(reader.read_positions(&mut hits[..2])).unwrap();
+    block_on(reader.read_docs(&docs[..2])).unwrap();
+    assert_eq!(posting_file.ranges.lock().unwrap().len(), 1);
+    assert_eq!(position_file.ranges.lock().unwrap().len(), 1);
+    assert_eq!(posting_file.whole_reads.lock().unwrap().len(), 1);
+    assert_eq!(position_file.whole_reads.lock().unwrap().len(), 1);
+    eprintln!("Dense candidate evidence: posting_requests=1, posting_bytes={}, position_requests=1, position_bytes={}", posting_file.len(), position_file.len());
+    assert_eq!(hits[0].positions, [0]);
+    assert_eq!(hits[1].positions, [1, 2]);
+}
+
+#[test]
+fn unknown_position_total_chooses_whole_without_a_prefix_read() {
+    let doc_freq = 16_385;
+    let (postings, positions) = encoded_term(doc_freq, WithFreqsAndPositions, true);
+    let (position_file, positions) = async_file(positions, None);
+    let mut reader = CandidatePostingsReader::new(
+        doc_freq,
+        FileSlice::from(postings),
+        Some(positions),
+        WithFreqsAndPositions,
+        WithFreqsAndPositions,
+    );
+    let mut hits = block_on(reader.read_docs(&[0])).unwrap();
+    assert!(reader.total_positions().is_none());
+    block_on(reader.read_positions(&mut hits)).unwrap();
+    assert_eq!(
+        *position_file.ranges.lock().unwrap(),
+        vec![0..position_file.len()]
+    );
+    assert_eq!(position_file.whole_reads.lock().unwrap().len(), 1);
+    assert_eq!(hits[0].positions, [0]);
+}
+
+#[test]
+fn transport_merge_overread_can_choose_whole_before_postings_prefix() {
+    let (postings, _) = encoded_term(16_384, WithFreqs, true);
+    let (file, postings) = async_file(postings, None);
+    let mut reader = CandidatePostingsReader::new(16_384, postings, None, WithFreqs, WithFreqs);
+    reader.set_read_options(super::block_read::CandidateReadOptions {
+        max_merge_gap: file.len(),
+        max_read_bytes: 1024,
+    });
+    let hits = block_on(reader.read_docs(&[0, 49_149])).unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.doc).collect::<Vec<_>>(),
+        [0, 49_149]
+    );
+    assert_eq!(*file.whole_reads.lock().unwrap(), vec![0..file.len()]);
+    assert_eq!(file.ranges.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn whole_read_supports_batch_only_handles_and_checks_lengths() {
+    #[derive(Debug)]
+    struct BatchOnly(Arc<AsyncFile>);
+    impl HasLen for BatchOnly {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+    }
+    impl FileHandle for BatchOnly {
+        fn read_bytes(&self, _: Range<usize>) -> io::Result<OwnedBytes> {
+            panic!("synchronous fallback is forbidden");
+        }
+        fn read_bytes_batch_async<'a, 'b>(
+            &'a self,
+            ranges: Vec<Range<usize>>,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Vec<OwnedBytes>>> + Send + 'b>>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.0.read_bytes_batch_async(ranges)
+        }
+    }
+    for short in [false, true] {
+        let (file, _) = async_file(vec![1, 2, 3], short.then_some(0));
+        let slice = FileSlice::new(Arc::new(BatchOnly(file.clone())));
+        let result = block_on(super::block_read::read_whole(&slice));
+        if short {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        } else {
+            assert_eq!(result.unwrap().as_slice(), &[1, 2, 3]);
+        }
+        assert_eq!(*file.ranges.lock().unwrap(), vec![0..3]);
+    }
+}
+
+#[test]
+fn sparse_candidates_remain_sparse_with_bounded_coalescing_transport() {
+    let (postings, positions) = encoded_term(16_384, WithFreqsAndPositions, true);
+    let (posting_file, postings) = async_file(postings, None);
+    let (position_file, positions) = async_file(positions, None);
+    let mut reader = CandidatePostingsReader::new(
+        16_384,
+        postings,
+        Some(positions),
+        WithFreqsAndPositions,
+        WithFreqsAndPositions,
+    );
+    reader.set_read_options(super::block_read::CandidateReadOptions {
+        max_merge_gap: 4096,
+        max_read_bytes: 1024 * 1024,
+    });
+    let mut hits = block_on(reader.read_docs(&[0, 49_149])).unwrap();
+    block_on(reader.read_positions(&mut hits)).unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.doc).collect::<Vec<_>>(),
+        [0, 49_149]
+    );
+    assert_eq!(hits[0].positions, [0]);
+    let expected: Vec<_> = (0..hits[1].term_freq).map(|i| 16_383 % 7 + i).collect();
+    assert_eq!(hits[1].positions, expected);
+    for file in [posting_file, position_file] {
+        assert!(file.whole_reads.lock().unwrap().is_empty());
+        let ranges = file.ranges.lock().unwrap();
+        let bytes: usize = ranges.iter().map(Range::len).sum();
+        assert!(bytes < file.len() / 3);
+        eprintln!(
+            "Bounded transport sparse logical evidence: requests={}, bytes={}, whole_bytes={}",
+            ranges.len(),
+            bytes,
+            file.len()
+        );
+    }
 }

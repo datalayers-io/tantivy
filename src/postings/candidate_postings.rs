@@ -3,7 +3,10 @@ use std::ops::Range;
 
 use common::VInt;
 
-use super::block_read::{invalid_data, read_blocks, read_exact, read_vint, yield_once};
+use super::block_read::{
+    invalid_data, read_blocks, read_exact, read_vint, read_whole, yield_once, CandidateReadOptions,
+    CandidateReadPlan,
+};
 use super::compression::{compressed_block_size, BlockDecoder, COMPRESSION_BLOCK_SIZE};
 use super::skip::skip_entry_len;
 use super::{BlockInfo, SkipReader};
@@ -125,7 +128,7 @@ impl PostingsLayout {
             record_option,
             total_positions: (record_option.has_positions()
                 && (doc_freq as usize).is_multiple_of(COMPRESSION_BLOCK_SIZE))
-                .then(|| skip_reader.position_offset()),
+            .then(|| skip_reader.position_offset()),
             prefix: OwnedBytes::empty(),
         })
     }
@@ -139,6 +142,7 @@ pub(crate) struct CandidatePostingsReader {
     record_option: IndexRecordOption,
     requested_option: IndexRecordOption,
     layout: Option<PostingsLayout>,
+    options: CandidateReadOptions,
 }
 
 impl CandidatePostingsReader {
@@ -156,7 +160,87 @@ impl CandidatePostingsReader {
             record_option,
             requested_option,
             layout: None,
+            options: CandidateReadOptions::default(),
         }
+    }
+
+    pub(crate) fn set_read_options(&mut self, options: CandidateReadOptions) {
+        self.options = options;
+        if let Some(positions) = &mut self.positions {
+            positions.set_read_options(options);
+        }
+    }
+
+    fn plan_docs(&self, candidates: usize) -> CandidateReadPlan {
+        let full_blocks = self.doc_freq as usize / COMPRESSION_BLOCK_SIZE;
+        let tail_docs = self.doc_freq as usize % COMPRESSION_BLOCK_SIZE;
+        let selected = candidates.min(full_blocks + usize::from(tail_docs != 0));
+        let streams = 1 + usize::from(self.record_option.has_freq());
+        let block_bytes = COMPRESSION_BLOCK_SIZE * 4 * streams;
+        // Include the tail in addition to all potentially selected full blocks:
+        // an overestimate avoids assuming where any candidate lives before the skip read.
+        let payload = selected
+            .min(full_blocks)
+            .saturating_mul(block_bytes)
+            .saturating_add(if selected != 0 {
+                tail_docs * 5 * streams
+            } else {
+                0
+            });
+        let skip_len = full_blocks * skip_entry_len(self.record_option);
+        let prefix = if full_blocks == 0 {
+            0
+        } else {
+            skip_len + VInt(skip_len as u64).serialize_into(&mut [0; 10])
+        };
+        let gaps = selected
+            .saturating_sub(1)
+            .saturating_mul(self.options.max_merge_gap);
+        if self.postings.len() <= SMALL_POSTINGS_BYTES {
+            CandidateReadPlan::whole(self.postings.len())
+        } else {
+            CandidateReadPlan::choose(
+                self.postings.len(),
+                prefix,
+                payload,
+                selected,
+                gaps,
+                self.options,
+            )
+        }
+    }
+
+    async fn load_whole(&mut self) -> io::Result<()> {
+        let bytes = read_whole(&self.postings).await?;
+        let mut layout = PostingsLayout::parse(
+            self.doc_freq,
+            self.postings.len(),
+            self.record_option,
+            &bytes,
+        )?;
+        layout.prefix = bytes;
+        // Skip metadata omits the tail's frequency sum. Decode just that bounded
+        // tail so position planning can know the total before reading its header.
+        if layout.record_option.has_positions() && self.requested_option.has_freq() {
+            if let Some(block) = layout.blocks.last() {
+                if matches!(block.info, BlockInfo::VInt { .. }) {
+                    let mut tail = Vec::new();
+                    self.decode_block(
+                        &layout,
+                        block,
+                        &layout.prefix[block.bytes.clone()],
+                        None,
+                        &mut tail,
+                    )?;
+                    layout.total_positions = Some(
+                        block.position_offset
+                            + tail.iter().map(|hit| u64::from(hit.term_freq)).sum::<u64>(),
+                    );
+                }
+            }
+        }
+        self.layout = Some(layout);
+        Ok(())
     }
 
     /// Prepare the skip table for subsequent postings reads.
@@ -188,16 +272,15 @@ impl CandidatePostingsReader {
 
     /// Read the driving posting list in one async operation, leaving its positions unloaded.
     pub(crate) async fn all_docs(&mut self) -> io::Result<Vec<CandidatePosting>> {
-        let bytes = read_exact(&self.postings, 0..self.postings.len()).await?;
-        if self.layout.is_none() {
-            self.layout = Some(PostingsLayout::parse(
-                self.doc_freq,
-                self.postings.len(),
-                self.record_option,
-                &bytes,
-            )?);
+        if self
+            .layout
+            .as_ref()
+            .is_none_or(|layout| layout.prefix.len() != self.postings.len())
+        {
+            self.load_whole().await?;
         }
         let layout = self.layout.as_ref().unwrap();
+        let bytes = &layout.prefix;
         let mut postings = Vec::with_capacity(self.doc_freq as usize);
         for (block_idx, block) in layout.blocks.iter().enumerate() {
             if block_idx != 0 && block_idx % DECODE_BLOCKS_PER_YIELD == 0 {
@@ -236,7 +319,15 @@ impl CandidatePostingsReader {
                 "posting candidates must be sorted unique document IDs",
             ));
         }
-        self.load().await?;
+        if self.layout.is_none() {
+            let plan = self.plan_docs(candidates.len());
+            plan.record("postings");
+            if plan.whole {
+                self.load_whole().await?;
+            } else {
+                self.load().await?;
+            }
+        }
         let layout = self.layout.as_ref().unwrap();
         let mut selected = Vec::new();
         let mut blocks = layout.blocks.as_slice();
@@ -271,6 +362,14 @@ impl CandidatePostingsReader {
         self.layout
             .as_ref()
             .and_then(|layout| layout.total_positions)
+    }
+
+    pub(crate) fn position_read_bytes(&self, hits: &[CandidatePosting]) -> io::Result<usize> {
+        self.positions.as_ref().map_or(Ok(0), |reader| {
+            reader
+                .plan(&position_ranges(hits), self.total_positions())
+                .map(|plan| plan.bytes_upper_bound)
+        })
     }
 
     /// Fetch the selected compressed position blocks for later decoding in bounded batches.

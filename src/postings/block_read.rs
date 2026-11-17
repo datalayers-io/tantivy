@@ -5,6 +5,99 @@ use std::task::Poll;
 
 use crate::directory::{FileSlice, OwnedBytes};
 
+/// Physical batch transport limits used to conservatively admit selective reads.
+///
+/// Supply the same limits as the directory's batch coalescer. These are cold-read
+/// upper bounds conditional on these transport limits and no cache hits;
+/// they are not exact request counts after cache filtering. Whole reads use the ordinary async
+/// file read and are not split by these batch limits.
+#[derive(Clone, Copy, Debug)]
+pub struct CandidateReadOptions {
+    /// Largest gap the batch transport may fetch between requested ranges.
+    pub max_merge_gap: usize,
+    /// Maximum body size of a physical batch request. Must be nonzero.
+    pub max_read_bytes: usize,
+}
+
+impl Default for CandidateReadOptions {
+    fn default() -> Self {
+        Self {
+            max_merge_gap: 0,
+            max_read_bytes: usize::MAX,
+        }
+    }
+}
+
+/// An inspectable cold-read alternative, chosen before paying metadata I/O.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CandidateReadPlan {
+    pub(crate) whole: bool,
+    pub(crate) bytes_upper_bound: usize,
+    pub(crate) gets_upper_bound: usize,
+    pub(crate) dependent_phases: usize,
+}
+
+impl CandidateReadPlan {
+    pub(crate) fn whole(len: usize) -> Self {
+        Self {
+            whole: true,
+            bytes_upper_bound: len,
+            gets_upper_bound: usize::from(len != 0),
+            dependent_phases: usize::from(len != 0),
+        }
+    }
+
+    pub(crate) fn choose(
+        len: usize,
+        prefix: usize,
+        payload: usize,
+        ranges: usize,
+        gaps: usize,
+        options: CandidateReadOptions,
+    ) -> Self {
+        let bytes = prefix.saturating_add(payload).saturating_add(gaps);
+        if bytes >= len {
+            return Self::whole(len);
+        }
+        let cap = options.max_read_bytes.max(1);
+        // Each range can add one partial body; splitting adds at most total/cap.
+        let gets = prefix
+            .div_ceil(cap)
+            .saturating_add(ranges)
+            .saturating_add(payload.saturating_add(gaps) / cap);
+        Self {
+            whole: false,
+            bytes_upper_bound: bytes,
+            gets_upper_bound: gets,
+            dependent_phases: usize::from(prefix != 0) + usize::from(ranges != 0),
+        }
+    }
+
+    pub(crate) fn record(self, kind: &str) {
+        debug!("Candidate {kind} read plan: whole={}, cold_bytes_upper={}, cold_gets_upper={}, dependent_phases={}",
+            self.whole, self.bytes_upper_bound, self.gets_upper_bound, self.dependent_phases);
+    }
+}
+
+/// Preserve the directory's normal whole-range transport without batch splitting.
+pub(crate) async fn read_whole(file: &FileSlice) -> io::Result<OwnedBytes> {
+    use crate::HasLen;
+    if file.len() == 0 {
+        return Ok(OwnedBytes::empty());
+    }
+    let bytes = match file.read_bytes_async().await {
+        Ok(bytes) => bytes,
+        // Older adapters may implement batch async alone. Preserve compatibility
+        // without hiding real I/O failures or changing normal whole-read transport.
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            return read_exact(file, 0..file.len()).await;
+        }
+        Err(error) => return Err(error),
+    };
+    check_length(&bytes, file.len())?;
+    Ok(bytes)
+}
+
 pub(crate) fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }

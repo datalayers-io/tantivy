@@ -4,7 +4,10 @@ use std::ops::Range;
 use common::VInt;
 
 use crate::directory::{FileSlice, OwnedBytes};
-use crate::postings::block_read::{invalid_data, read_blocks, read_exact, read_vint};
+use crate::postings::block_read::{
+    invalid_data, read_blocks, read_exact, read_vint, read_whole, CandidateReadOptions,
+    CandidateReadPlan,
+};
 use crate::postings::compression::{compressed_block_size, BlockDecoder};
 use crate::HasLen;
 
@@ -24,6 +27,7 @@ pub(crate) struct CandidatePositionReader {
     file: FileSlice,
     layout: Option<PositionLayout>,
     prefetched: Vec<(usize, OwnedBytes)>,
+    options: CandidateReadOptions,
 }
 
 impl CandidatePositionReader {
@@ -32,10 +36,80 @@ impl CandidatePositionReader {
             file,
             layout: None,
             prefetched: Vec::new(),
+            options: CandidateReadOptions::default(),
         }
     }
 
-    async fn load(&mut self, total_positions: Option<u64>) -> io::Result<()> {
+    pub(crate) fn set_read_options(&mut self, options: CandidateReadOptions) {
+        self.options = options;
+    }
+
+    pub(crate) fn plan(
+        &self,
+        ranges: &[Range<u64>],
+        total: Option<u64>,
+    ) -> io::Result<CandidateReadPlan> {
+        if ranges.is_empty() {
+            return Ok(CandidateReadPlan::whole(0));
+        }
+        let mut previous_end = 0;
+        let mut last_block: Option<u64> = None;
+        let mut selected = 0usize;
+        let mut gaps = 0usize;
+        for range in ranges {
+            if range.start < previous_end
+                || range.start >= range.end
+                || total.is_some_and(|total| range.end > total)
+            {
+                return Err(invalid_data("invalid position range for posting"));
+            }
+            let first = range.start / COMPRESSION_BLOCK_SIZE as u64;
+            let last = (range.end - 1) / COMPRESSION_BLOCK_SIZE as u64;
+            let start = last_block.map_or(first, |prev| first.max(prev + 1));
+            if start <= last {
+                selected = selected
+                    .saturating_add(usize::try_from(last - start + 1).unwrap_or(usize::MAX));
+                if last_block.is_none_or(|prev| first > prev + 1) {
+                    if let Some(prev) = last_block {
+                        let omitted = usize::try_from(first - prev - 1).unwrap_or(usize::MAX);
+                        gaps = gaps.saturating_add(
+                            omitted
+                                .saturating_mul(COMPRESSION_BLOCK_SIZE * 4)
+                                .min(self.options.max_merge_gap),
+                        );
+                    }
+                }
+                last_block = Some(last);
+            }
+            previous_end = range.end;
+        }
+        let Some(total) = total else {
+            // Zero-width blocks mean file length cannot tightly bound the header.
+            return Ok(CandidateReadPlan::whole(self.file.len()));
+        };
+        let full_blocks = usize::try_from(total / COMPRESSION_BLOCK_SIZE as u64)
+            .map_err(|_| invalid_data("position block count overflow"))?;
+        let header =
+            full_blocks.saturating_add(VInt(full_blocks as u64).serialize_into(&mut [0; 10]));
+        let prefix = self.file.len().min(POSITION_PREFIX_BYTES.max(header));
+        let tail = usize::from(last_block == Some(full_blocks as u64));
+        let payload = selected
+            .saturating_sub(tail)
+            .saturating_mul(COMPRESSION_BLOCK_SIZE * 4)
+            .saturating_add(tail * (total as usize % COMPRESSION_BLOCK_SIZE) * 5);
+        // The transport receives one logical range per block. Even contiguous
+        // blocks can fill different capped bodies, so count each as an upper bound.
+        Ok(CandidateReadPlan::choose(
+            self.file.len(),
+            prefix,
+            payload,
+            selected,
+            gaps,
+            self.options,
+        ))
+    }
+
+    async fn load(&mut self, total_positions: Option<u64>, whole: bool) -> io::Result<()> {
         if self.layout.is_some() {
             return Ok(());
         }
@@ -56,7 +130,11 @@ impl CandidatePositionReader {
             .file
             .len()
             .min(POSITION_PREFIX_BYTES.max(expected_header));
-        let prefix = read_exact(&self.file, 0..prefix_len).await?;
+        let prefix = if whole {
+            read_whole(&self.file).await?
+        } else {
+            read_exact(&self.file, 0..prefix_len).await?
+        };
         let mut bytes = prefix.as_slice();
         let full_blocks = usize::try_from(read_vint(&mut bytes, 64)?)
             .map_err(|_| invalid_data("position block count overflow"))?;
@@ -161,7 +239,11 @@ impl CandidatePositionReader {
         total_positions: Option<u64>,
     ) -> io::Result<()> {
         if !ranges.is_empty() {
-            self.load(total_positions).await?;
+            if self.layout.is_none() {
+                let plan = self.plan(ranges, total_positions)?;
+                plan.record("positions");
+                self.load(total_positions, plan.whole).await?;
+            }
             let blocks = self.select_blocks(ranges, total_positions)?;
             let bytes = self.read_blocks(&blocks).await?;
             self.prefetched = blocks.into_iter().zip(bytes).collect();
@@ -177,7 +259,11 @@ impl CandidatePositionReader {
         if ranges.is_empty() {
             return Ok(Vec::new());
         }
-        self.load(total_positions).await?;
+        let plan = self.plan(ranges, total_positions)?;
+        if self.layout.is_none() {
+            plan.record("positions");
+        }
+        self.load(total_positions, plan.whole).await?;
         let blocks = self.select_blocks(ranges, total_positions)?;
         let bytes = self.read_blocks(&blocks).await?;
         let mut blocks = blocks.into_iter().zip(bytes);
