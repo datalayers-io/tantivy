@@ -4,8 +4,8 @@ use std::ops::Range;
 use common::VInt;
 
 use super::block_read::{
-    invalid_data, read_blocks, read_exact, read_vint, read_whole, yield_once, CandidateReadOptions,
-    CandidateReadPlan,
+    invalid_data, read_blocks_with_optional_tail, read_exact, read_vint, read_whole, yield_once,
+    CandidateReadOptions, CandidateReadPlan,
 };
 use super::compression::{compressed_block_size, BlockDecoder, COMPRESSION_BLOCK_SIZE};
 use super::skip::skip_entry_len;
@@ -224,18 +224,13 @@ impl CandidatePostingsReader {
         if layout.record_option.has_positions() && self.requested_option.has_freq() {
             if let Some(block) = layout.blocks.last() {
                 if matches!(block.info, BlockInfo::VInt { .. }) {
-                    let mut tail = Vec::new();
-                    self.decode_block(
+                    layout.total_positions = self.decode_block(
                         &layout,
                         block,
                         &layout.prefix[block.bytes.clone()],
-                        None,
-                        &mut tail,
+                        Some(&[]),
+                        &mut Vec::new(),
                     )?;
-                    layout.total_positions = Some(
-                        block.position_offset
-                            + tail.iter().map(|hit| u64::from(hit.term_freq)).sum::<u64>(),
-                    );
                 }
             }
         }
@@ -345,19 +340,43 @@ impl CandidatePostingsReader {
             .iter()
             .map(|(block, _)| block.bytes.clone())
             .collect();
-        let bytes = read_blocks(&self.postings, &layout.prefix, &ranges).await?;
+        let tail = layout.blocks.last().filter(|block| {
+            layout.total_positions.is_none()
+                && self.positions.is_some()
+                && matches!(block.info, BlockInfo::VInt { .. })
+                && ranges.last().is_some_and(|last| {
+                    last.end <= block.bytes.start
+                        && block.bytes.start - last.end <= self.options.max_merge_gap
+                })
+        });
+        let (bytes, optional_tail) = read_blocks_with_optional_tail(
+            &self.postings,
+            &layout.prefix,
+            &ranges,
+            tail.map(|block| block.bytes.clone()),
+        )
+        .await?;
+        let mut total = layout.total_positions;
+        if let (Some(block), Some(bytes)) = (tail, optional_tail) {
+            total = self.decode_block(layout, block, &bytes, Some(&[]), &mut Vec::new())?;
+        }
         let mut postings = Vec::new();
         for (block_idx, ((block, candidates), bytes)) in selected.into_iter().zip(bytes).enumerate()
         {
             if block_idx != 0 && block_idx % DECODE_BLOCKS_PER_YIELD == 0 {
                 yield_once().await;
             }
-            self.decode_block(layout, block, &bytes, Some(candidates), &mut postings)?;
+            let decoded_tail =
+                self.decode_block(layout, block, &bytes, Some(candidates), &mut postings)?;
+            if decoded_tail.is_some() {
+                total = decoded_tail;
+            }
         }
+        self.layout.as_mut().unwrap().total_positions = total;
         Ok(postings)
     }
 
-    /// Return the position count when the skip table or a full postings read determines it.
+    /// Return the position count when the skip table or an already-read tail determines it.
     pub(crate) fn total_positions(&self) -> Option<u64> {
         self.layout
             .as_ref()
@@ -366,9 +385,7 @@ impl CandidatePostingsReader {
 
     pub(crate) fn position_read_bytes(&self, hits: &[CandidatePosting]) -> io::Result<usize> {
         self.positions.as_ref().map_or(Ok(0), |reader| {
-            reader
-                .plan(&position_ranges(hits), self.total_positions())
-                .map(|plan| plan.bytes_upper_bound)
+            reader.read_upper_bound(&position_ranges(hits), self.total_positions())
         })
     }
 
@@ -408,7 +425,7 @@ impl CandidatePostingsReader {
         mut bytes: &[u8],
         candidates: Option<&[DocId]>,
         output: &mut Vec<CandidatePosting>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<u64>> {
         let mut doc_decoder = BlockDecoder::default();
         let mut freq_decoder = BlockDecoder::default();
         let mut tail_docs = [0; COMPRESSION_BLOCK_SIZE];
@@ -524,7 +541,10 @@ impl CandidatePostingsReader {
                 ));
             }
         }
-        Ok(())
+        Ok((record_option.has_positions()
+            && read_freqs
+            && matches!(block.info, BlockInfo::VInt { .. }))
+        .then_some(position_offset))
     }
 }
 

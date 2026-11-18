@@ -8,11 +8,11 @@ use columnar::{
 };
 use common::ByteCount;
 
+use crate::TantivyError;
 use crate::core::json_utils::{encode_column_name, json_path_sep_to_dot};
 use crate::directory::FileSlice;
 use crate::schema::{Field, FieldEntry, FieldType, Schema};
 use crate::space_usage::{FieldUsage, PerFieldSpaceUsage};
-use crate::TantivyError;
 
 /// Provides access to all of the BitpackedFastFieldReader.
 ///
@@ -175,6 +175,31 @@ impl FastFieldReaders {
     /// If `field` is not a u64 fast field, this method returns an Error.
     pub fn u64(&self, field: &str) -> crate::Result<Column<u64>> {
         self.column(field)
+    }
+
+    /// Looks up the first u64 value for each document, in input order. A missing
+    /// value in an optional column receives the supplied default.
+    pub async fn first_u64_values(
+        &self,
+        field: &str,
+        docs: &[u32],
+        default_value: u64,
+        max_merge_gap: usize,
+        min_saving_per_extra_get: usize,
+    ) -> crate::Result<Vec<u64>> {
+        let field_name = self.resolve_field(field)?.ok_or_else(|| {
+            crate::TantivyError::InvalidArgument(format!("Missing fast field {field}"))
+        })?;
+        Ok(self
+            .columnar
+            .first_u64_values(
+                &field_name,
+                docs,
+                default_value,
+                max_merge_gap,
+                min_saving_per_extra_get,
+            )
+            .await?)
     }
 
     /// Returns the `date` fast field reader reader associated with `field`.
@@ -383,7 +408,7 @@ impl FastFieldReaders {
 mod tests {
     use columnar::ColumnType;
 
-    use crate::schema::{JsonObjectOptions, Schema, FAST};
+    use crate::schema::{FAST, JsonObjectOptions, Schema};
     use crate::tokenizer::RAW_TOKENIZER_NAME;
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -494,15 +519,21 @@ mod tests {
 
         let foo_columns = fast_fields.dynamic_column_handles("json.foo").unwrap();
         assert_eq!(foo_columns.len(), 3);
-        assert!(foo_columns
-            .iter()
-            .any(|column| column.column_type() == ColumnType::I64));
-        assert!(foo_columns
-            .iter()
-            .any(|column| column.column_type() == ColumnType::Bool));
-        assert!(foo_columns
-            .iter()
-            .any(|column| column.column_type() == ColumnType::Str));
+        assert!(
+            foo_columns
+                .iter()
+                .any(|column| column.column_type() == ColumnType::I64)
+        );
+        assert!(
+            foo_columns
+                .iter()
+                .any(|column| column.column_type() == ColumnType::Bool)
+        );
+        assert!(
+            foo_columns
+                .iter()
+                .any(|column| column.column_type() == ColumnType::Str)
+        );
 
         let json_columns = fast_fields.dynamic_column_handles("json").unwrap();
         assert_eq!(json_columns.len(), 0);
@@ -516,3 +547,7 @@ mod tests {
         assert_eq!(foo_subcolumns.len(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "sparse_u64_tests.rs"]
+mod sparse_u64_tests;

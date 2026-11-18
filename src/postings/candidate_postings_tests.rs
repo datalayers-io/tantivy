@@ -152,6 +152,32 @@ impl FileHandle for AsyncFile {
         })
     }
 
+    fn read_bytes_batch_with_optional_tail_async<'a, 'b>(
+        &'a self,
+        mut ranges: Vec<Range<usize>>,
+        tail: Range<usize>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<(Vec<OwnedBytes>, Option<OwnedBytes>)>> + Send + 'b>>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        Box::pin(async move {
+            let Some(last) = ranges.last_mut() else {
+                return Ok((Vec::new(), None));
+            };
+            if last.end != tail.start {
+                return Ok((self.read_bytes_batch_async(ranges).await?, None));
+            }
+            let required_len = last.len();
+            last.end = tail.end;
+            let mut result = self.read_bytes_batch_async(ranges).await?;
+            let last = result.last_mut().unwrap();
+            let extra = last.slice(required_len..last.len());
+            *last = last.slice(0..required_len);
+            Ok((result, Some(extra)))
+        })
+    }
+
     fn read_bytes_batch_async<'a, 'b>(
         &'a self,
         ranges: Vec<Range<usize>>,
@@ -506,10 +532,92 @@ fn dense_candidates_choose_whole_before_metadata_and_reuse_bytes() {
 }
 
 #[test]
-fn unknown_position_total_chooses_whole_without_a_prefix_read() {
+fn unknown_position_total_reads_the_position_directory_without_fetching_the_posting_tail() {
     let doc_freq = 16_385;
     let (postings, positions) = encoded_term(doc_freq, WithFreqsAndPositions, true);
     let (position_file, positions) = async_file(positions, None);
+    let (posting_file, postings) = async_file(postings, None);
+    let mut reader = CandidatePostingsReader::new(
+        doc_freq,
+        postings,
+        Some(positions),
+        WithFreqsAndPositions,
+        WithFreqsAndPositions,
+    );
+    let mut hits = block_on(reader.read_docs(&[0])).unwrap();
+    assert!(reader.total_positions().is_none());
+    let before = posting_file.ranges.lock().unwrap().clone();
+    block_on(reader.read_positions(&mut hits)).unwrap();
+    assert_eq!(*posting_file.ranges.lock().unwrap(), before);
+    let reads = position_file.ranges.lock().unwrap();
+    assert_eq!(reads[0], 0..4096);
+    assert!(reads.iter().map(Range::len).sum::<usize>() < position_file.len());
+    assert!(position_file.whole_reads.lock().unwrap().is_empty());
+    assert_eq!(hits[0].positions, [0]);
+}
+
+#[test]
+fn partial_tail_frequency_sum_includes_documents_outside_the_candidates() {
+    let doc_freq = 16_389;
+    let expected = (0..doc_freq)
+        .map(|doc| u64::from(if doc == 130 { 190 } else { 1 + doc % 11 }))
+        .sum::<u64>();
+    // Last packed document (adjacent tail) and first tail document (required tail).
+    for doc in [16_383, 16_384] {
+        let (postings, positions) = encoded_term(doc_freq, WithFreqsAndPositions, true);
+        let (posting_file, postings) = async_file(postings, None);
+        let mut reader = CandidatePostingsReader::new(
+            doc_freq,
+            postings,
+            Some(FileSlice::from(positions)),
+            WithFreqsAndPositions,
+            WithFreqsAndPositions,
+        );
+        let hits = block_on(reader.read_docs(&[doc * 3])).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(reader.total_positions(), Some(expected));
+        let reads = posting_file.ranges.lock().unwrap();
+        assert_eq!(
+            reads.len(),
+            2,
+            "one skip and one payload GET, including the tail"
+        );
+        assert_eq!(reads[1].end, posting_file.len());
+        assert!(posting_file.whole_reads.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn packed_posting_can_reference_the_position_tail() {
+    let mut posting_bytes = Vec::new();
+    let mut position_bytes = Vec::new();
+    let mut postings = PostingsSerializer::new(0.0, WithFreqsAndPositions, None);
+    let mut positions = PositionSerializer::new(&mut position_bytes);
+    postings.new_term(129, true);
+    for doc in 0..129 {
+        let tf = if doc == 0 { 2 } else { 1 };
+        postings.write_doc(doc, tf);
+        positions.write_positions_delta(&[7, 1][..tf as usize]);
+    }
+    postings.close_term(129, &mut posting_bytes).unwrap();
+    positions.close_term().unwrap();
+    positions.close().unwrap();
+
+    // Doc 127 is the last packed posting. Its position ordinal is 128.
+    let (_, slice) = async_file(position_bytes, None);
+    let mut positions = crate::positions::CandidatePositionReader::new(slice);
+    let ordinals = std::iter::once(128..129).collect::<Vec<_>>();
+    assert_eq!(
+        block_on(positions.read_positions(&ordinals, None)).unwrap(),
+        [vec![7]]
+    );
+}
+
+#[test]
+fn unknown_position_directory_can_extend_beyond_initial_prefix() {
+    let doc_freq = 91_137;
+    let (postings, positions) = encoded_term(doc_freq, WithFreqsAndPositions, true);
+    let (file, positions) = async_file(positions, None);
     let mut reader = CandidatePostingsReader::new(
         doc_freq,
         FileSlice::from(postings),
@@ -518,14 +626,44 @@ fn unknown_position_total_chooses_whole_without_a_prefix_read() {
         WithFreqsAndPositions,
     );
     let mut hits = block_on(reader.read_docs(&[0])).unwrap();
-    assert!(reader.total_positions().is_none());
+    assert_eq!(reader.total_positions(), None);
+    block_on(reader.prefetch_positions(&hits)).unwrap();
     block_on(reader.read_positions(&mut hits)).unwrap();
-    assert_eq!(
-        *position_file.ranges.lock().unwrap(),
-        vec![0..position_file.len()]
-    );
-    assert_eq!(position_file.whole_reads.lock().unwrap().len(), 1);
     assert_eq!(hits[0].positions, [0]);
+    let reads = file.ranges.lock().unwrap();
+    assert_eq!(reads.len(), 3, "prefix, missing widths, selected payload");
+    assert_eq!(reads[0], 0..4096);
+    assert_eq!(reads[1].start, reads[0].end);
+    assert_eq!(reads[2].start, reads[1].end);
+    assert!(reads[2].end < file.len());
+}
+
+#[test]
+fn unknown_position_total_uses_whole_remainder_when_sparse_costs_more() {
+    let doc_freq = 16_385;
+    let (postings, positions) = encoded_term(doc_freq, WithFreqsAndPositions, true);
+    let (file, positions) = async_file(positions, None);
+    let mut reader = CandidatePostingsReader::new(
+        doc_freq,
+        FileSlice::from(postings),
+        Some(positions),
+        WithFreqsAndPositions,
+        WithFreqsAndPositions,
+    );
+    reader.set_read_options(super::block_read::CandidateReadOptions {
+        min_saving_per_extra_get: usize::MAX,
+        ..Default::default()
+    });
+    let mut hits = block_on(reader.read_docs(&[24_576, 36_864])).unwrap();
+    assert_eq!(reader.total_positions(), None);
+    block_on(reader.prefetch_positions(&hits)).unwrap();
+    block_on(reader.read_positions(&mut hits)).unwrap();
+    assert_eq!(hits[0].positions[0], 8192 % 7);
+    assert_eq!(
+        *file.ranges.lock().unwrap(),
+        vec![0..4096, 4096..file.len()]
+    );
+    assert_eq!(*file.whole_reads.lock().unwrap(), vec![4096..file.len()]);
 }
 
 #[test]
@@ -536,6 +674,7 @@ fn transport_merge_overread_can_choose_whole_before_postings_prefix() {
     reader.set_read_options(super::block_read::CandidateReadOptions {
         max_merge_gap: file.len(),
         max_read_bytes: 1024,
+        ..Default::default()
     });
     let hits = block_on(reader.read_docs(&[0, 49_149])).unwrap();
     assert_eq!(
@@ -598,6 +737,7 @@ fn sparse_candidates_remain_sparse_with_bounded_coalescing_transport() {
     reader.set_read_options(super::block_read::CandidateReadOptions {
         max_merge_gap: 4096,
         max_read_bytes: 1024 * 1024,
+        ..Default::default()
     });
     let mut hits = block_on(reader.read_docs(&[0, 49_149])).unwrap();
     block_on(reader.read_positions(&mut hits)).unwrap();

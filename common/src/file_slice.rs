@@ -33,6 +33,17 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
         ))
     }
 
+    /// Reads required ranges and optionally returns a nearby tail. Implementations may
+    /// include the tail only when it is already cached or fits an already needed
+    /// physical read without increasing the number of physical requests.
+    async fn read_bytes_batch_with_optional_tail_async(
+        &self,
+        ranges: Vec<Range<usize>>,
+        _tail: Range<usize>,
+    ) -> io::Result<(Vec<OwnedBytes>, Option<OwnedBytes>)> {
+        Ok((self.read_bytes_batch_async(ranges).await?, None))
+    }
+
     /// Reads several ranges, preserving their order and exact lengths.
     ///
     /// Implementations may coalesce physical reads. The default delegates each
@@ -110,7 +121,7 @@ impl FileHandle for WrapFile {
         {
             use std::io::{Read, Seek};
             let mut file = self.file.try_clone()?; // Clone the file to read from it separately
-            // Seek to the start position in the file
+                                                   // Seek to the start position in the file
             file.seek(io::SeekFrom::Start(start as u64))?;
             // Read the data into the buffer
             file.read_exact(&mut buffer)?;
@@ -296,6 +307,32 @@ impl FileSlice {
         self.data.read_bytes_batch_async(absolute).await
     }
 
+    /// Submits a batch with an optional tail, all relative to this slice.
+    pub async fn read_bytes_batch_with_optional_tail_async(
+        &self,
+        ranges: Vec<Range<usize>>,
+        tail: Range<usize>,
+    ) -> io::Result<(Vec<OwnedBytes>, Option<OwnedBytes>)> {
+        if ranges
+            .iter()
+            .chain(std::iter::once(&tail))
+            .any(|range| range.start > range.end || range.end > self.len())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid batch range",
+            ));
+        }
+        let absolute =
+            |range: Range<usize>| self.range.start + range.start..self.range.start + range.end;
+        self.data
+            .read_bytes_batch_with_optional_tail_async(
+                ranges.into_iter().map(absolute).collect(),
+                absolute(tail),
+            )
+            .await
+    }
+
     /// Reads a specific slice of data.
     ///
     /// This is equivalent to running `file_slice.slice(from, to).read_bytes()`.
@@ -374,6 +411,14 @@ impl FileSlice {
 
 #[async_trait]
 impl FileHandle for FileSlice {
+    async fn read_bytes_batch_with_optional_tail_async(
+        &self,
+        ranges: Vec<Range<usize>>,
+        tail: Range<usize>,
+    ) -> io::Result<(Vec<OwnedBytes>, Option<OwnedBytes>)> {
+        FileSlice::read_bytes_batch_with_optional_tail_async(self, ranges, tail).await
+    }
+
     async fn read_bytes_batch_async(
         &self,
         ranges: Vec<Range<usize>>,
@@ -414,8 +459,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{FileHandle, FileSlice};
-    use crate::HasLen;
     use crate::file_slice::combine_ranges;
+    use crate::HasLen;
 
     #[test]
     fn test_async_batch_preserves_nested_offsets_and_order() {

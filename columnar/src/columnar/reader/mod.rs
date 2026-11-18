@@ -1,3 +1,5 @@
+mod sparse_u64;
+
 use std::{fmt, io, mem};
 
 use common::BinarySerializable;
@@ -19,6 +21,7 @@ fn io_invalid_data(msg: String) -> io::Error {
 pub struct ColumnarReader {
     column_dictionary: Dictionary<RangeSSTable>,
     column_data: FileSlice,
+    file: FileSlice,
     num_docs: RowId,
     format_version: Version,
 }
@@ -93,12 +96,15 @@ fn column_dictionary_prefix_for_subpath(root_path: &str) -> String {
 impl ColumnarReader {
     /// Opens a new Columnar file.
     pub fn open<F>(file_slice: F) -> io::Result<ColumnarReader>
-    where FileSlice: From<F> {
+    where
+        FileSlice: From<F>,
+    {
         Self::open_inner(file_slice.into())
     }
 
     fn open_inner(file_slice: FileSlice) -> io::Result<ColumnarReader> {
         let (file_slice_without_sstable_len, footer_slice) = file_slice
+            .clone()
             .split_from_end(mem::size_of::<u64>() + 4 + format_version::VERSION_FOOTER_NUM_BYTES);
         let footer_bytes = footer_slice.read_bytes()?;
         let sstable_len = u64::deserialize(&mut &footer_bytes[0..8])?;
@@ -111,6 +117,7 @@ impl ColumnarReader {
         let column_dictionary = Dictionary::open(sstable)?;
         Ok(ColumnarReader {
             column_dictionary,
+            file: file_slice,
             column_data,
             num_docs: num_rows,
             format_version,

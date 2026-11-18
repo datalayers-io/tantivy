@@ -17,6 +17,8 @@ pub struct CandidateReadOptions {
     pub max_merge_gap: usize,
     /// Maximum body size of a physical batch request. Must be nonzero.
     pub max_read_bytes: usize,
+    /// Minimum cold bytes to save for each extra request after reading a position directory.
+    pub min_saving_per_extra_get: usize,
 }
 
 impl Default for CandidateReadOptions {
@@ -24,6 +26,7 @@ impl Default for CandidateReadOptions {
         Self {
             max_merge_gap: 0,
             max_read_bytes: usize::MAX,
+            min_saving_per_extra_get: 0,
         }
     }
 }
@@ -149,17 +152,46 @@ pub(crate) async fn read_blocks(
     prefix: &OwnedBytes,
     ranges: &[Range<usize>],
 ) -> io::Result<Vec<OwnedBytes>> {
+    Ok(read_blocks_with_optional_tail(file, prefix, ranges, None)
+        .await?
+        .0)
+}
+
+/// An optional tail is a hint to the physical planner, never a required read.
+pub(crate) async fn read_blocks_with_optional_tail(
+    file: &FileSlice,
+    prefix: &OwnedBytes,
+    ranges: &[Range<usize>],
+    tail: Option<Range<usize>>,
+) -> io::Result<(Vec<OwnedBytes>, Option<OwnedBytes>)> {
     let remote_ranges: Vec<_> = ranges
         .iter()
         .filter(|range| !range.is_empty() && range.end > prefix.len())
         .map(|range| range.start.max(prefix.len())..range.end)
         .collect();
-    let mut remote_bytes = if remote_ranges.is_empty() {
-        Vec::new()
-    } else {
-        file.read_bytes_batch_async(remote_ranges).await?
-    }
-    .into_iter();
+    let (remote, tail_bytes) = match tail {
+        Some(tail) if tail.end <= prefix.len() => (
+            if remote_ranges.is_empty() {
+                Vec::new()
+            } else {
+                file.read_bytes_batch_async(remote_ranges).await?
+            },
+            Some(prefix.slice(tail)),
+        ),
+        Some(tail) if !remote_ranges.is_empty() && tail.start >= prefix.len() => {
+            let len = tail.len();
+            let (blocks, tail) = file
+                .read_bytes_batch_with_optional_tail_async(remote_ranges, tail)
+                .await?;
+            if let Some(bytes) = &tail {
+                check_length(bytes, len)?;
+            }
+            (blocks, tail)
+        }
+        _ if remote_ranges.is_empty() => (Vec::new(), None),
+        _ => (file.read_bytes_batch_async(remote_ranges).await?, None),
+    };
+    let mut remote_bytes = remote.into_iter();
 
     let result = ranges
         .iter()
@@ -190,7 +222,7 @@ pub(crate) async fn read_blocks(
             "unexpected extra inverted index block from batch read",
         ));
     }
-    Ok(result)
+    Ok((result, tail_bytes))
 }
 
 /// Decode the same stop-bit VInt format as the legacy readers, with a length and overflow check.
